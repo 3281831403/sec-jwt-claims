@@ -17,8 +17,103 @@ Base64URL output is unpadded and uses the URL-safe alphabet.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import string
+from collections.abc import Mapping
+
 ALLOWED_ALGORITHMS = frozenset({"HS256"})
 MAX_CLOCK_SKEW = 60
+
+_B64URL_CHARS = frozenset(
+    string.ascii_letters + string.digits + "-_"
+)
+
+_MISSING = object()
+
+
+def _b64url_encode(raw: bytes) -> str:
+    """Encode bytes as unpadded Base64URL text."""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _decode_segment(segment: str, name: str) -> bytes:
+    """Strictly decode one unpadded Base64URL segment.
+
+    Rejects empty input, padding, any character outside the URL-safe
+    alphabet, impossible lengths, and non-canonical trailing bits.
+    """
+    if not segment:
+        raise ValueError(f"empty {name} segment")
+    for char in segment:
+        if char not in _B64URL_CHARS:
+            raise ValueError(f"invalid character in {name} segment")
+    if len(segment) % 4 == 1:
+        raise ValueError(f"impossible length for {name} segment")
+
+    padded = segment + "=" * (-len(segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"invalid {name} segment") from exc
+
+    if _b64url_encode(raw) != segment:
+        # Non-canonical trailing bits or an otherwise repairable segment.
+        raise ValueError(f"non-canonical {name} segment")
+    return raw
+
+
+def _decode_json_object(raw: bytes, name: str) -> dict:
+    """Decode a UTF-8 JSON object from one segment's bytes."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{name} segment is not valid UTF-8") from exc
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{name} segment is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} segment is not a JSON object")
+    return value
+
+
+def _is_int(value) -> bool:
+    """Return True for a genuine integer (booleans excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _normalise_key(key) -> bytes:
+    """Return the HMAC key as bytes, rejecting unsupported types."""
+    if isinstance(key, bytes):
+        return key
+    if isinstance(key, str):
+        return key.encode("utf-8")
+    raise TypeError("key must be bytes or a string")
+
+
+def _signing_input(header, payload) -> bytes:
+    """Build the canonical HS256 signing input for a header/payload pair."""
+    header_text = _b64url_encode(
+        json.dumps(
+            header,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    payload_text = _b64url_encode(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    return (header_text + "." + payload_text).encode("ascii")
 
 
 def split_token(token: str) -> tuple:
@@ -55,7 +150,22 @@ def split_token(token: str) -> tuple:
             carrying two JSON objects.
         TypeError: If ``token`` is not a string.
     """
-    raise NotImplementedError
+    if not isinstance(token, str):
+        raise TypeError("token must be a string")
+
+    segments = token.split(".")
+    if len(segments) != 3:
+        raise ValueError("token must contain exactly three segments")
+    if not all(segments):
+        raise ValueError("token contains an empty segment")
+
+    header_raw = _decode_segment(segments[0], "header")
+    payload_raw = _decode_segment(segments[1], "payload")
+    signature = _decode_segment(segments[2], "signature")
+
+    header = _decode_json_object(header_raw, "header")
+    payload = _decode_json_object(payload_raw, "payload")
+    return header, payload, signature
 
 
 def verify_signature(header: dict, payload: dict, signature: bytes, key) -> bool:
@@ -93,7 +203,30 @@ def verify_signature(header: dict, payload: dict, signature: bytes, key) -> bool
         TypeError: If ``key`` is neither bytes nor a string, or if the
             supplied header or payload is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(header, Mapping):
+        raise TypeError("header must be a mapping")
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be a mapping")
+    secret = _normalise_key(key)
+
+    # The algorithm is chosen here, never trusted from the token header.
+    algorithm = header.get("alg", _MISSING)
+    if not isinstance(algorithm, str) or algorithm not in ALLOWED_ALGORITHMS:
+        return False
+
+    if not isinstance(signature, (bytes, bytearray)):
+        return False
+    signature = bytes(signature)
+
+    try:
+        message = _signing_input(header, payload)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return False
+
+    expected = hmac.new(secret, message, hashlib.sha256).digest()
+    if len(signature) != len(expected):
+        return False
+    return hmac.compare_digest(expected, signature)
 
 
 def check_time(payload: dict, now: int, skew: int) -> bool:
@@ -130,7 +263,22 @@ def check_time(payload: dict, now: int, skew: int) -> bool:
         ValueError: If ``now`` is not an integer, or if ``skew`` is not an
             integer in the closed range 0 through 60.
     """
-    raise NotImplementedError
+    if not _is_int(now):
+        raise ValueError("now must be an integer")
+    if not _is_int(skew) or not 0 <= skew <= MAX_CLOCK_SKEW:
+        raise ValueError(f"skew must be an integer from 0 to {MAX_CLOCK_SKEW}")
+
+    if not isinstance(payload, Mapping):
+        return False
+    nbf = payload.get("nbf", _MISSING)
+    exp = payload.get("exp", _MISSING)
+    if not _is_int(nbf) or not _is_int(exp):
+        return False
+    if nbf > exp:
+        return False
+
+    # The allowance is applied once to each boundary, never compounded.
+    return nbf - skew <= now < exp + skew
 
 
 def check_audience(payload: dict, expected: str) -> bool:
@@ -158,7 +306,26 @@ def check_audience(payload: dict, expected: str) -> bool:
     Raises:
         ValueError: If ``expected`` is not a non-empty string.
     """
-    raise NotImplementedError
+    if not isinstance(expected, str) or expected == "":
+        raise ValueError("expected audience must be a non-empty string")
+
+    if not isinstance(payload, Mapping):
+        return False
+    audience = payload.get("aud", _MISSING)
+
+    if isinstance(audience, str):
+        return audience != "" and audience == expected
+
+    if isinstance(audience, list):
+        if not audience:
+            return False
+        for member in audience:
+            if not isinstance(member, str) or member == "":
+                return False
+        # Check the whole array, not just its first element.
+        return expected in audience
+
+    return False
 
 
 def check_issuer(payload: dict, allowed) -> bool:
@@ -188,7 +355,32 @@ def check_issuer(payload: dict, allowed) -> bool:
         TypeError: If ``allowed`` is neither a string nor an iterable of
             strings.
     """
-    raise NotImplementedError
+    if isinstance(allowed, str):
+        candidates = [allowed]
+    elif isinstance(allowed, (bytes, bytearray)):
+        raise TypeError("allowed must not be bytes")
+    else:
+        try:
+            candidates = list(allowed)
+        except TypeError as exc:
+            raise TypeError(
+                "allowed must be a string or an iterable of strings"
+            ) from exc
+
+    if not candidates:
+        raise ValueError("issuer whitelist must not be empty")
+    for candidate in candidates:
+        if not isinstance(candidate, str) or candidate == "":
+            raise ValueError("issuer whitelist contains an invalid entry")
+
+    if not isinstance(payload, Mapping):
+        return False
+    issuer = payload.get("iss", _MISSING)
+    if not isinstance(issuer, str) or issuer == "":
+        return False
+
+    # Full-string equality only; no prefix or substring matching.
+    return issuer in candidates
 
 
 def validate_claims(payload: dict, policy: dict, now: int) -> dict:
@@ -228,7 +420,24 @@ def validate_claims(payload: dict, policy: dict, now: int) -> dict:
         ValueError: If the policy is not valid or ``now`` is invalid.
         TypeError: If ``policy`` is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping):
+        raise TypeError("policy must be a mapping")
+
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError("invalid policy: " + ", ".join(issues))
+
+    time_ok = check_time(payload, now, policy["max_skew"])
+    audience_ok = check_audience(payload, policy["audience"])
+    issuer_ok = check_issuer(payload, policy["issuers"])
+
+    # Every individual result is preserved; none is allowed to be swallowed.
+    return {
+        "time": time_ok,
+        "audience": audience_ok,
+        "issuer": issuer_ok,
+        "valid": bool(time_ok and audience_ok and issuer_ok),
+    }
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -279,7 +488,34 @@ def validate_policy(policy: dict) -> list[str]:
     Raises:
         TypeError: If ``policy`` is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping):
+        raise TypeError("policy must be a mapping")
+
+    issues = []
+
+    algorithms = policy.get("algorithms", _MISSING)
+    if not isinstance(algorithms, (list, tuple)) or len(algorithms) == 0:
+        issues.append("algorithm_unrestricted")
+    elif any(algorithm != "HS256" for algorithm in algorithms):
+        issues.append("algorithm_not_allowed")
+
+    max_skew = policy.get("max_skew", _MISSING)
+    if not _is_int(max_skew) or max_skew < 0:
+        issues.append("skew_invalid")
+    elif max_skew > MAX_CLOCK_SKEW:
+        issues.append("skew_excessive")
+
+    audience = policy.get("audience", _MISSING)
+    if not isinstance(audience, str) or audience.strip() == "":
+        issues.append("audience_empty")
+
+    issuers = policy.get("issuers", _MISSING)
+    if not isinstance(issuers, (list, tuple)) or len(issuers) == 0:
+        issues.append("issuer_unrestricted")
+    elif any(not isinstance(issuer, str) or issuer == "" for issuer in issuers):
+        issues.append("issuer_unrestricted")
+
+    return issues
 
 
 def claims_batch(tokens, policy: dict, now: int) -> dict:
@@ -325,4 +561,51 @@ def claims_batch(tokens, policy: dict, now: int) -> dict:
         ValueError: If the policy is invalid, ``key`` is missing or invalid,
             or ``now`` is invalid.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping):
+        raise TypeError("policy must be a mapping")
+
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError("invalid policy: " + ", ".join(issues))
+
+    key = policy.get("key", _MISSING)
+    if key is _MISSING or not isinstance(key, (bytes, str)):
+        raise ValueError("policy must contain a bytes or string key")
+
+    if not _is_int(now):
+        raise ValueError("now must be an integer")
+
+    results = {}
+    for token in tokens:
+        # Start every iteration from scratch: no cached header, payload,
+        # signature, audience, or claim state carries over between tokens.
+        try:
+            header, payload, signature = split_token(token)
+        except (ValueError, TypeError):
+            results[token] = {
+                "signature": False,
+                "time": False,
+                "audience": False,
+                "issuer": False,
+                "valid": False,
+                "error": "malformed",
+            }
+            continue
+
+        signature_ok = verify_signature(header, payload, signature, key)
+        checks = validate_claims(payload, policy, now)
+
+        results[token] = {
+            "signature": signature_ok,
+            "time": checks["time"],
+            "audience": checks["audience"],
+            "issuer": checks["issuer"],
+            "valid": bool(
+                signature_ok
+                and checks["time"]
+                and checks["audience"]
+                and checks["issuer"]
+            ),
+        }
+
+    return results

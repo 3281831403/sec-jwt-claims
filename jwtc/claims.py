@@ -17,8 +17,71 @@ Base64URL output is unpadded and uses the URL-safe alphabet.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+from collections.abc import Mapping
+
 ALLOWED_ALGORITHMS = frozenset({"HS256"})
 MAX_CLOCK_SKEW = 60
+
+_B64URL_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789-_"
+)
+_B64URL_INDEX = {char: index for index, char in enumerate(_B64URL_ALPHABET)}
+
+
+def _canonical_json(value) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _b64url_encode(raw: bytes) -> bytes:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+def _b64url_decode(segment: str) -> bytes:
+    """Strictly decode one unpadded Base64URL segment."""
+    if not segment or "=" in segment:
+        raise ValueError("base64url segment is empty or carries padding")
+    for char in segment:
+        if char not in _B64URL_INDEX:
+            raise ValueError("character outside the base64url alphabet")
+    remainder = len(segment) % 4
+    if remainder == 1:
+        raise ValueError("impossible base64url length")
+    if remainder == 2 and _B64URL_INDEX[segment[-1]] & 0b1111:
+        raise ValueError("invalid trailing base64url bits")
+    if remainder == 3 and _B64URL_INDEX[segment[-1]] & 0b11:
+        raise ValueError("invalid trailing base64url bits")
+    padding = "=" * ((4 - remainder) % 4)
+    try:
+        return base64.urlsafe_b64decode(segment + padding)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("malformed base64url segment") from exc
+
+
+def _decode_json_object(segment: str) -> dict:
+    raw = _b64url_decode(segment)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("segment is not valid UTF-8") from exc
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("segment is not valid JSON") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("segment must encode a JSON object")
+    return obj
 
 
 def split_token(token: str) -> tuple:
@@ -55,7 +118,19 @@ def split_token(token: str) -> tuple:
             carrying two JSON objects.
         TypeError: If ``token`` is not a string.
     """
-    raise NotImplementedError
+    if not isinstance(token, str):
+        raise TypeError("token must be a string")
+    segments = token.split(".")
+    # Defect 1 fix: exactly three segments; no two-segment or unsigned token.
+    if len(segments) != 3:
+        raise ValueError("token must contain exactly three segments")
+    if any(segment == "" for segment in segments):
+        raise ValueError("token segments must be non-empty")
+    # Defect 2 fix: decode with the URL-safe Base64 alphabet, no padding.
+    header = _decode_json_object(segments[0])
+    payload = _decode_json_object(segments[1])
+    signature = _b64url_decode(segments[2])
+    return header, payload, signature
 
 
 def verify_signature(header: dict, payload: dict, signature: bytes, key) -> bool:
@@ -93,7 +168,27 @@ def verify_signature(header: dict, payload: dict, signature: bytes, key) -> bool
         TypeError: If ``key`` is neither bytes nor a string, or if the
             supplied header or payload is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(header, Mapping) or not isinstance(payload, Mapping):
+        raise TypeError("header and payload must be mappings")
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    elif not isinstance(key, bytes):
+        raise TypeError("key must be bytes or a string")
+    if not isinstance(signature, bytes):
+        return False
+    # Defects 3 and 4 fix: the algorithm is chosen by this function from a
+    # fixed allowlist, never from the token.  A missing alg, "none", mixed
+    # case, or a non-string value all fail before any HMAC is computed.
+    alg = header.get("alg")
+    if not isinstance(alg, str) or alg not in ALLOWED_ALGORITHMS:
+        return False
+    signing_input = (
+        _b64url_encode(_canonical_json(header))
+        + b"."
+        + _b64url_encode(_canonical_json(payload))
+    )
+    expected = hmac.new(key, signing_input, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, signature)
 
 
 def check_time(payload: dict, now: int, skew: int) -> bool:
@@ -130,7 +225,28 @@ def check_time(payload: dict, now: int, skew: int) -> bool:
         ValueError: If ``now`` is not an integer, or if ``skew`` is not an
             integer in the closed range 0 through 60.
     """
-    raise NotImplementedError
+    if not isinstance(now, int) or isinstance(now, bool):
+        raise ValueError("now must be an integer")
+    if not isinstance(skew, int) or isinstance(skew, bool) or not (
+        0 <= skew <= MAX_CLOCK_SKEW
+    ):
+        raise ValueError("skew must be an integer from 0 through 60")
+
+    nbf = payload.get("nbf")
+    exp = payload.get("exp")
+    # Booleans are not accepted as integer timestamps.
+    if (
+        not isinstance(nbf, int)
+        or isinstance(nbf, bool)
+        or not isinstance(exp, int)
+        or isinstance(exp, bool)
+        or exp <= nbf
+    ):
+        return False
+
+    # Defects 5 and 6 fix: honor nbf (not just exp) and apply the allowance
+    # exactly once to each boundary: nbf - skew <= now < exp + skew.
+    return nbf - skew <= now < exp + skew
 
 
 def check_audience(payload: dict, expected: str) -> bool:
@@ -158,7 +274,26 @@ def check_audience(payload: dict, expected: str) -> bool:
     Raises:
         ValueError: If ``expected`` is not a non-empty string.
     """
-    raise NotImplementedError
+    if not isinstance(expected, str) or expected == "":
+        raise ValueError("expected audience must be a non-empty string")
+
+    aud = payload.get("aud")
+    if isinstance(aud, str):
+        if aud == "":
+            return False
+        return aud == expected
+    if isinstance(aud, (list, tuple)):
+        if not aud:
+            return False
+        # Every member must be a non-empty string; an invalid list never
+        # matches.  Membership is checked across the whole list, not only at
+        # index zero (defect 7 fix).
+        for member in aud:
+            if not isinstance(member, str) or member == "":
+                return False
+        return expected in aud
+    # Missing claim or invalid type.
+    return False
 
 
 def check_issuer(payload: dict, allowed) -> bool:
@@ -188,7 +323,25 @@ def check_issuer(payload: dict, allowed) -> bool:
         TypeError: If ``allowed`` is neither a string nor an iterable of
             strings.
     """
-    raise NotImplementedError
+    if isinstance(allowed, str):
+        allowed_values = [allowed]
+    else:
+        try:
+            allowed_values = list(allowed)
+        except TypeError as exc:
+            raise TypeError("allowed must be a string or an iterable") from exc
+
+    if not allowed_values:
+        raise ValueError("issuer whitelist must not be empty")
+    for value in allowed_values:
+        if not isinstance(value, str) or value == "":
+            raise ValueError("issuer whitelist entries must be non-empty strings")
+
+    iss = payload.get("iss")
+    if not isinstance(iss, str) or iss == "":
+        return False
+    # Defect 8 fix: exact equality only; prefix/substring matching is forbidden.
+    return iss in allowed_values
 
 
 def validate_claims(payload: dict, policy: dict, now: int) -> dict:
@@ -228,7 +381,24 @@ def validate_claims(payload: dict, policy: dict, now: int) -> dict:
         ValueError: If the policy is not valid or ``now`` is invalid.
         TypeError: If ``policy`` is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping):
+        raise TypeError("policy must be a mapping")
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError(f"invalid policy: {', '.join(issues)}")
+
+    time_ok = check_time(payload, now, policy["max_skew"])
+    audience_ok = check_audience(payload, policy["audience"])
+    issuer_ok = check_issuer(payload, policy["issuers"])
+
+    # Defect 9 fix: each check reports its own boolean and a single failure
+    # makes "valid" false instead of being swallowed.
+    return {
+        "time": time_ok,
+        "audience": audience_ok,
+        "issuer": issuer_ok,
+        "valid": time_ok and audience_ok and issuer_ok,
+    }
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -279,7 +449,40 @@ def validate_policy(policy: dict) -> list[str]:
     Raises:
         TypeError: If ``policy`` is not a mapping.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping):
+        raise TypeError("policy must be a mapping")
+
+    issues: list[str] = []
+
+    algorithms = policy.get("algorithms")
+    if not isinstance(algorithms, (list, tuple)) or len(algorithms) == 0:
+        issues.append("algorithm_unrestricted")
+    elif any(alg != "HS256" for alg in algorithms):
+        issues.append("algorithm_not_allowed")
+
+    max_skew = policy.get("max_skew")
+    if (
+        not isinstance(max_skew, int)
+        or isinstance(max_skew, bool)
+        or max_skew < 0
+    ):
+        issues.append("skew_invalid")
+    elif max_skew > MAX_CLOCK_SKEW:
+        issues.append("skew_excessive")
+
+    audience = policy.get("audience")
+    if not isinstance(audience, str) or audience.strip() == "":
+        issues.append("audience_empty")
+
+    issuers = policy.get("issuers")
+    if (
+        not isinstance(issuers, (list, tuple))
+        or len(issuers) == 0
+        or any(not isinstance(item, str) or item == "" for item in issuers)
+    ):
+        issues.append("issuer_unrestricted")
+
+    return issues
 
 
 def claims_batch(tokens, policy: dict, now: int) -> dict:
@@ -325,4 +528,42 @@ def claims_batch(tokens, policy: dict, now: int) -> dict:
         ValueError: If the policy is invalid, ``key`` is missing or invalid,
             or ``now`` is invalid.
     """
-    raise NotImplementedError
+    if not isinstance(policy, Mapping):
+        raise TypeError("policy must be a mapping")
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError(f"invalid policy: {', '.join(issues)}")
+    key = policy.get("key")
+    if not isinstance(key, (bytes, str)):
+        raise ValueError("policy key must be bytes or a string")
+    if not isinstance(now, int) or isinstance(now, bool):
+        raise ValueError("now must be an integer")
+
+    results: dict[str, dict] = {}
+    malformed_result = {
+        "signature": False,
+        "time": False,
+        "audience": False,
+        "issuer": False,
+        "valid": False,
+        "error": "malformed",
+    }
+
+    for token in tokens:
+        # Defect 10 fix: every iteration creates fresh local state; nothing
+        # decoded for one token is ever reused by the next.
+        try:
+            header, payload, signature = split_token(token)
+            signature_ok = verify_signature(header, payload, signature, key)
+            checks = validate_claims(payload, policy, now)
+        except (ValueError, TypeError):
+            results[token] = dict(malformed_result)
+            continue
+        results[token] = {
+            "signature": signature_ok,
+            "time": checks["time"],
+            "audience": checks["audience"],
+            "issuer": checks["issuer"],
+            "valid": signature_ok and checks["valid"],
+        }
+    return results
